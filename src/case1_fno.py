@@ -1,8 +1,9 @@
 import torch.nn as nn
 import torch
 from neuralop.models import FNO1d
+import torch.nn.functional as F
 
-class PredictorFNO(nn.Module):
+class MultistepPredictorFNO(nn.Module):
     def __init__(
         self,
         hidden_size,
@@ -11,8 +12,11 @@ class PredictorFNO(nn.Module):
         input_channel,
         fno_output_channel,
         output_dim,
+        output_horizon,
     ):
         super().__init__()
+
+        self.output_horizon = output_horizon
 
         self.fno = FNO1d(
             n_modes_height=modes,
@@ -20,13 +24,6 @@ class PredictorFNO(nn.Module):
             hidden_channels=hidden_size,
             in_channels=input_channel,
             out_channels=fno_output_channel,
-        )
-
-        # scalar attention score per horizon location
-        self.attn = nn.Sequential(
-            nn.Linear(fno_output_channel, fno_output_channel),
-            nn.GELU(),
-            nn.Linear(fno_output_channel, 1),
         )
 
         self.head = nn.Sequential(
@@ -37,21 +34,24 @@ class PredictorFNO(nn.Module):
 
     def forward(self, x):
         """
-        x: (batch, grid, input_channel)
+        x: (batch, input_grid, input_channel)
 
         returns:
-            (batch, output_dim)
+            (batch, output_horizon, output_dim)
         """
         # FNO1d expects (batch, channels, grid)
-        y = self.fno(x.transpose(1, 2))      # (B, C, G)
-        y = y.transpose(1, 2)                # (B, G, C)
+        y = self.fno(x.transpose(1, 2))   # (B, C, G_in)
 
-        # attention weights over horizon
-        scores = self.attn(y)                # (B, G, 1)
-        weights = torch.softmax(scores, dim=1)
+        # Resize latent grid to desired multistep horizon
+        if y.shape[-1] != self.output_horizon:
+            y = F.interpolate(
+                y,
+                size=self.output_horizon,
+                mode="linear",
+                align_corners=False,
+            )  # (B, C, G_out)
 
-        # weighted sum over horizon
-        pooled = (weights * y).sum(dim=1)    # (B, C)
+        y = y.transpose(1, 2)             # (B, G_out, C)
 
-        out = self.head(pooled)              # (B, output_dim)
+        out = self.head(y)                # (B, G_out, output_dim)
         return out

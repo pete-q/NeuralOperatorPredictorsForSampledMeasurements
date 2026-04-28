@@ -7,10 +7,10 @@ import copy
 import time
 import matplotlib.pyplot as plt
 
-def build_fno_dataset(dataset):
-    state = dataset["state"]          # (N, state_dim)
-    u_hist = dataset["u_hist"]        # (N, delay_steps, control_dim)
-    target = dataset["predictor"]     # (N, output_dim)
+def build_multistep_fno_dataset(dataset):
+    state = dataset["state"]                   # (N, state_dim)
+    u_hist = dataset["u_hist"]                 # (N, delay_steps, control_dim)
+    target = dataset["predictor_traj"]         # (N, horizon, state_dim)
 
     N, delay_steps, _ = u_hist.shape
 
@@ -19,12 +19,12 @@ def build_fno_dataset(dataset):
 
     return X, target
 
-def fit_normalizers(X_train, Y_train, eps=1e-8):
+def fit_multistep_normalizers(X_train, Y_train, eps=1e-8):
     x_mean = X_train.mean(axis=(0, 1), keepdims=True)
     x_std = X_train.std(axis=(0, 1), keepdims=True) + eps
 
-    y_mean = Y_train.mean(axis=0, keepdims=True)
-    y_std = Y_train.std(axis=0, keepdims=True) + eps
+    y_mean = Y_train.mean(axis=(0, 1), keepdims=True)
+    y_std = Y_train.std(axis=(0, 1), keepdims=True) + eps
 
     stats = {
         "x_mean": x_mean,
@@ -32,30 +32,41 @@ def fit_normalizers(X_train, Y_train, eps=1e-8):
         "y_mean": y_mean,
         "y_std": y_std,
     }
+
     return stats
 
-
-def normalize_dataset(X, Y, stats):
+def normalize_multistep_dataset(X, Y, stats):
     Xn = (X - stats["x_mean"]) / stats["x_std"]
     Yn = (Y - stats["y_mean"]) / stats["y_std"]
+
     return Xn, Yn
 
-
-def denormalize_y(Yn, stats):
+def denormalize_multistep_predictions(Yn, stats):
     return Yn * stats["y_std"] + stats["y_mean"]
 
-def make_dataloaders(X, Y, batch_size=64, val_fraction=0.2, seed=0):
+def make_multistep_dataloaders(
+    X,
+    Y,
+    batch_size=64,
+    val_fraction=0.2,
+    seed=0,
+):
+
     X_train, X_val, Y_train, Y_val = train_test_split(
-        X, Y, test_size=val_fraction, random_state=seed
+        X,
+        Y,
+        test_size=val_fraction,
+        random_state=seed,
     )
 
-    stats = fit_normalizers(X_train, Y_train)
+    stats = fit_multistep_normalizers(X_train, Y_train)
 
-    X_train, Y_train = normalize_dataset(X_train, Y_train, stats)
-    X_val, Y_val = normalize_dataset(X_val, Y_val, stats)
+    X_train, Y_train = normalize_multistep_dataset(X_train, Y_train, stats)
+    X_val, Y_val = normalize_multistep_dataset(X_val, Y_val, stats)
 
     X_train = torch.tensor(X_train, dtype=torch.float32)
     Y_train = torch.tensor(Y_train, dtype=torch.float32)
+
     X_val = torch.tensor(X_val, dtype=torch.float32)
     Y_val = torch.tensor(Y_val, dtype=torch.float32)
 
@@ -73,7 +84,7 @@ def make_dataloaders(X, Y, batch_size=64, val_fraction=0.2, seed=0):
 
     return train_loader, val_loader, stats
 
-def train_one_epoch(model, loader, optimizer, device):
+def train_multistep_one_epoch(model, loader, optimizer, device):
     model.train()
     loss_fn = nn.MSELoss()
 
@@ -84,7 +95,7 @@ def train_one_epoch(model, loader, optimizer, device):
         xb = xb.to(device)
         yb = yb.to(device)
 
-        pred = model(xb)
+        pred = model(xb)                     # (B, horizon, state_dim)
         loss = loss_fn(pred, yb)
 
         optimizer.zero_grad()
@@ -97,8 +108,9 @@ def train_one_epoch(model, loader, optimizer, device):
 
     return total_loss / total_count
 
+
 @torch.no_grad()
-def evaluate(model, loader, device):
+def evaluate_multistep_model(model, loader, device):
     model.eval()
     loss_fn = nn.MSELoss()
 
@@ -109,7 +121,7 @@ def evaluate(model, loader, device):
         xb = xb.to(device)
         yb = yb.to(device)
 
-        pred = model(xb)
+        pred = model(xb)                     # (B, horizon, state_dim)
         loss = loss_fn(pred, yb)
 
         batch_size = xb.shape[0]
@@ -119,7 +131,7 @@ def evaluate(model, loader, device):
     return total_loss / total_count
 
 
-def train_model(
+def train_multistep_model(
     model,
     train_loader,
     val_loader,
@@ -127,9 +139,10 @@ def train_model(
     epochs=100,
     lr=1e-3,
     weight_decay=1e-6,
-    save_path="predictor_fno.pt",
+    save_path="multistep_predictor_fno.pt",
 ):
     model = model.to(device)
+
     optimizer = torch.optim.Adam(
         model.parameters(),
         lr=lr,
@@ -152,13 +165,25 @@ def train_model(
     }
 
     for epoch in range(1, epochs + 1):
-        train_loss = train_one_epoch(model, train_loader, optimizer, device)
-        val_loss = evaluate(model, val_loader, device)
+        epoch_start = time.perf_counter()
+        train_loss = train_multistep_one_epoch(
+            model,
+            train_loader,
+            optimizer,
+            device,
+        )
+        val_loss = evaluate_multistep_model(
+            model,
+            val_loader,
+            device,
+        )
 
         scheduler.step(val_loss)
 
         history["train_loss"].append(train_loss)
         history["val_loss"].append(val_loss)
+
+        epoch_time = time.perf_counter() - epoch_start
 
         if val_loss < best_val_loss:
             best_val_loss = val_loss
@@ -174,23 +199,28 @@ def train_model(
                 save_path,
             )
 
-        if epoch == 1 or epoch % 10 == 0:
-            lr_now = optimizer.param_groups[0]["lr"]
-            print(
-                f"epoch {epoch:4d} | "
-                f"train {train_loss:.6e} | "
-                f"val {val_loss:.6e} | "
-                f"lr {lr_now:.2e}"
-            )
-            # reload best weights safely
+        lr_now = optimizer.param_groups[0]["lr"]
+        print(
+            f"epoch {epoch:4d} | "
+            f"train {train_loss:.6e} | "
+            f"val {val_loss:.6e} | "
+            f"lr {lr_now:.2e} | "
+            f"time {epoch_time:.2f}s"
+        )
+
     clean_state = {k: v for k, v in best_state.items()}
     clean_state.pop("_metadata", None)
 
     model.load_state_dict(clean_state)
     return model, history
 
-def load_trained_model(model, checkpoint_path, device):
-    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+
+def load_trained_multistep_model(model, checkpoint_path, device):
+    checkpoint = torch.load(
+        checkpoint_path,
+        map_location=device,
+        weights_only=False,
+    )
 
     state_dict = checkpoint["model_state_dict"]
     state_dict.pop("_metadata", None)
@@ -201,14 +231,15 @@ def load_trained_model(model, checkpoint_path, device):
 
     return model, checkpoint
 
-def plot_training_history(history):
+
+def plot_multistep_training_history(history):
     plt.figure(figsize=(7, 4))
     plt.plot(history["train_loss"], label="train")
     plt.plot(history["val_loss"], label="val")
     plt.yscale("log")
     plt.xlabel("epoch")
     plt.ylabel("MSE loss")
-    plt.title("Training history")
+    plt.title("Multistep predictor training history")
     plt.grid(True)
     plt.legend()
     plt.tight_layout()
